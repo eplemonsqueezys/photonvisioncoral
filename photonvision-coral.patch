@@ -1,0 +1,396 @@
+diff --git a/build.gradle b/build.gradle
+index f9bb4d7..b18e111 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -42,7 +42,8 @@ ext {
+     javalinVersion = "6.7.0"
+     libcameraDriverVersion = "v2027.0.0-alpha-1"
+     rknnVersion = "v2027.0.0"
+-    tfliteVersion = "v2027.0.2-alpha-1"
++    // Override with -PtfliteVersion=<version> to use a locally published tflite_jni
++    tfliteVersion = project.findProperty("tfliteVersion") ?: "v2027.0.2-coral"
+     wpilibYear = "2027_alpha7"
+     mrcalVersion = "dev-v2027.0.2-12-gdc31176";
+ 
+diff --git a/photon-client/src/components/settings/ObjectDetectionCard.vue b/photon-client/src/components/settings/ObjectDetectionCard.vue
+index f7968ab..d0b6a40 100644
+--- a/photon-client/src/components/settings/ObjectDetectionCard.vue
++++ b/photon-client/src/components/settings/ObjectDetectionCard.vue
+@@ -198,21 +198,33 @@ const handleBulkImport = async () => {
+                   640x640 YOLOv8 and YOLOv11 models trained and converted to `.tflite` format for QCS6490 compatible
+                   backends are currently supported!
+                 </span>
++                <span v-else-if="useSettingsStore().general.supportedBackends?.includes('CORAL')"
++                  >Upload a new object detection model to this device that can be used in a pipeline.
++                </span>
+                 <span v-else>
+                   If you're seeing this, something broke; please file a ticket and tell us the details of your
+                   situation.</span
+                 >
++                <span v-if="useSettingsStore().general.supportedBackends?.includes('CORAL')">
++                  A Coral USB Accelerator was detected: YOLOv8 and YOLO11 models exported with
++                  `yolo export format=edgetpu` (file ending in `_edgetpu.tflite`) are also supported. Enter the
++                  export's image size (usually 320x320) as the width and height.
++                </span>
+                 <div class="pa-5 pb-0">
+                   <v-file-input
+                     v-model="importModelFile"
+                     variant="underlined"
+                     label="Model File"
+                     :accept="
+-                      useSettingsStore().general.supportedBackends?.includes('RKNN')
+-                        ? '.rknn'
+-                        : useSettingsStore().general.supportedBackends?.includes('RUBIK')
++                      [
++                        useSettingsStore().general.supportedBackends?.includes('RKNN') ? '.rknn' : '',
++                        useSettingsStore().general.supportedBackends?.includes('RUBIK') ||
++                        useSettingsStore().general.supportedBackends?.includes('CORAL')
+                           ? '.tflite'
+                           : ''
++                      ]
++                        .filter((ext) => ext !== '')
++                        .join(',')
+                     "
+                   />
+                   <v-text-field
+diff --git a/photon-client/src/types/SettingTypes.ts b/photon-client/src/types/SettingTypes.ts
+index 3d94044..a4a7e60 100644
+--- a/photon-client/src/types/SettingTypes.ts
++++ b/photon-client/src/types/SettingTypes.ts
+@@ -23,7 +23,7 @@ export interface ObjectDetectionModelProperties {
+   labels: string[];
+   resolutionWidth: number;
+   resolutionHeight: number;
+-  family: "RKNN" | "RUBIK";
++  family: "RKNN" | "RUBIK" | "CORAL";
+   version: "YOLOV5" | "YOLOV8" | "YOLOV11";
+ }
+ 
+diff --git a/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java b/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
+index 94f8d52..1586668 100644
+--- a/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
++++ b/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
+@@ -35,6 +35,7 @@ import java.util.jar.JarEntry;
+ import java.util.jar.JarFile;
+ import java.util.stream.Stream;
+ import org.photonvision.common.configuration.NeuralNetworkModelsSettings.ModelProperties;
++import org.photonvision.common.hardware.EdgeTpu;
+ import org.photonvision.common.hardware.Platform;
+ import org.photonvision.common.logging.LogGroup;
+ import org.photonvision.common.logging.Logger;
+@@ -202,13 +203,21 @@ public class NeuralNetworkModelManager {
+         switch (Platform.getCurrentPlatform()) {
+             case LINUX_QCS6490 -> supportedBackends.add(Family.RUBIK);
+             case LINUX_RK3588_64 -> supportedBackends.add(Family.RKNN);
+-            default -> {
+-                logger.warn(
+-                        "No supported neural network backends found for this platform: "
+-                                + Platform.getCurrentPlatform());
+-                // No supported backends, so we won't load any models
+-                return;
+-            }
++            default -> {}
++        }
++
++        // A Coral USB Accelerator can be added to any Linux device that ships tflite_jni
++        // (linuxarm64 / linuxx86-64). It is added after the built-in NPU, so the NPU's
++        // shipped models stay the default.
++        if (EdgeTpu.isUsbCoralPresent()) {
++            logger.info("Coral USB Accelerator detected, enabling CORAL backend");
++            supportedBackends.add(Family.CORAL);
++        }
++
++        if (supportedBackends.isEmpty()) {
++            logger.warn(
++                    "No supported neural network backends found for this platform: "
++                            + Platform.getCurrentPlatform());
+         }
+     }
+ 
+@@ -240,7 +249,9 @@ public class NeuralNetworkModelManager {
+ 
+     public enum Family {
+         RKNN(".rknn"),
+-        RUBIK(".tflite");
++        RUBIK(".tflite"),
++        /** Google Coral Edge TPU. Models must be compiled with edgetpu_compiler. */
++        CORAL("_edgetpu.tflite");
+ 
+         private final String fileExtension;
+ 
+@@ -251,6 +262,16 @@ public class NeuralNetworkModelManager {
+         public String extension() {
+             return fileExtension;
+         }
++
++        /**
++         * Picks the family whose extension best matches a file name, among the given families. The
++         * longest matching extension wins, so "foo_edgetpu.tflite" maps to CORAL rather than RUBIK.
++         */
++        public static Optional<Family> forFileName(String fileName, List<Family> candidates) {
++            return candidates.stream()
++                    .filter(f -> fileName.endsWith(f.extension()))
++                    .max((a, b) -> Integer.compare(a.extension().length(), b.extension().length()));
++        }
+     }
+ 
+     public enum Version {
+@@ -309,7 +330,13 @@ public class NeuralNetworkModelManager {
+             return Optional.empty();
+         }
+ 
+-        return models.get(supportedBackends.get(0)).stream().findFirst();
++        for (Family backend : supportedBackends) {
++            var backendModels = models.get(backend);
++            if (backendModels != null && !backendModels.isEmpty()) {
++                return Optional.of(backendModels.get(0));
++            }
++        }
++        return Optional.empty();
+     }
+ 
+     // Do checking later on, when we create the model object
+@@ -361,7 +388,10 @@ public class NeuralNetworkModelManager {
+                     models.get(properties.family()).add(new RknnModel(properties));
+                 }
+                 case RUBIK -> {
+-                    models.get(properties.family()).add(new TFLiteModel(properties, TFLiteSource.RUBIK));
++                    models.get(properties.family()).add(new TFLiteModel(properties, TFLiteSource.QNN));
++                }
++                case CORAL -> {
++                    models.get(properties.family()).add(new TFLiteModel(properties, TFLiteSource.CORAL));
+                 }
+             }
+             logger.info(
+@@ -397,8 +427,8 @@ public class NeuralNetworkModelManager {
+                     .filter(Files::isRegularFile)
+                     .filter(
+                             path ->
+-                                    supportedBackends.stream()
+-                                            .anyMatch(family -> path.toString().endsWith(family.extension())))
++                                    Family.forFileName(path.getFileName().toString(), supportedBackends)
++                                            .isPresent())
+                     .forEach(this::loadModel);
+         } catch (IOException e) {
+             logger.error("Failed to discover models at " + modelsDirectory.getAbsolutePath(), e);
+diff --git a/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java b/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java
+new file mode 100644
+index 0000000..6bbfc55
+--- /dev/null
++++ b/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java
+@@ -0,0 +1,80 @@
++/*
++ * Copyright (C) Photon Vision.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package org.photonvision.common.hardware;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.stream.Stream;
++
++/** Detects a Google Coral USB Accelerator (Edge TPU). */
++public final class EdgeTpu {
++    private EdgeTpu() {}
++
++    /**
++     * USB vendor:product IDs of the Coral USB Accelerator. Before libedgetpu uploads firmware it
++     * enumerates as Global Unichip 1a6e:089a; afterwards as Google 18d1:9302.
++     */
++    private static final String[][] USB_IDS = {{"1a6e", "089a"}, {"18d1", "9302"}};
++
++    private static final Path USB_DEVICES = Path.of("/sys/bus/usb/devices");
++
++    private static Boolean cached = null;
++
++    /** Returns true if a Coral USB Accelerator is plugged in. Result is cached after first call. */
++    public static synchronized boolean isUsbCoralPresent() {
++        if (cached == null) {
++            cached = scan();
++        }
++        return cached;
++    }
++
++    private static boolean scan() {
++        if (!Platform.isLinux() || !Files.isDirectory(USB_DEVICES)) {
++            return false;
++        }
++
++        try (Stream<Path> devices = Files.list(USB_DEVICES)) {
++            return devices.anyMatch(EdgeTpu::isCoral);
++        } catch (IOException e) {
++            return false;
++        }
++    }
++
++    private static boolean isCoral(Path dev) {
++        String vendor = readId(dev.resolve("idVendor"));
++        String product = readId(dev.resolve("idProduct"));
++        if (vendor == null || product == null) {
++            return false;
++        }
++        for (String[] id : USB_IDS) {
++            if (id[0].equals(vendor) && id[1].equals(product)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static String readId(Path p) {
++        try {
++            return Files.readString(p).trim().toLowerCase();
++        } catch (IOException e) {
++            return null;
++        }
++    }
++}
+diff --git a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
+index 3a9031e..ef1b95f 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
++++ b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
+@@ -52,8 +52,8 @@ public class TFLiteModel implements Model {
+             throw new IllegalArgumentException("Resolution must be greater than 0");
+         }
+ 
+-        if (properties.family() != Family.RUBIK) {
+-            throw new IllegalArgumentException("Model family must be RUBIK");
++        if (properties.family() != Family.RUBIK && properties.family() != Family.CORAL) {
++            throw new IllegalArgumentException("Model family must be RUBIK or CORAL");
+         }
+ 
+         if (properties.version() != Version.YOLOV8 && properties.version() != Version.YOLOV11) {
+diff --git a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
+index 2160ed0..6c86d13 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
++++ b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
+@@ -61,7 +61,7 @@ public class TFLiteObjectDetector implements ObjectDetector {
+      * Creates a new TFLite detector from the given model.
+      *
+      * @param model The model to create the detector from.
+-     * @param source The backend to run the detector on.
++     * @param backend The backend to run the detector on (QNN for Rubik, CORAL for Edge TPU).
+      */
+     public TFLiteObjectDetector(TFLiteModel model, TFLiteSource backend) {
+         this.model = model;
+diff --git a/photon-server/src/main/java/org/photonvision/Main.java b/photon-server/src/main/java/org/photonvision/Main.java
+index e1674dd..0420f03 100644
+--- a/photon-server/src/main/java/org/photonvision/Main.java
++++ b/photon-server/src/main/java/org/photonvision/Main.java
+@@ -30,6 +30,7 @@ import org.photonvision.common.configuration.CameraConfiguration;
+ import org.photonvision.common.configuration.ConfigProvider;
+ import org.photonvision.common.configuration.NeuralNetworkModelManager;
+ import org.photonvision.common.dataflow.networktables.NetworkTablesManager;
++import org.photonvision.common.hardware.EdgeTpu;
+ import org.photonvision.common.hardware.HardwareManager;
+ import org.photonvision.common.hardware.OsImageData;
+ import org.photonvision.common.hardware.PiVersion;
+@@ -266,10 +267,11 @@ public class Main implements Callable<Integer> {
+             logger.warn("Platform does not support RKNN based machine learning!");
+         }
+ 
+-        if (Platform.isQCS6490()) {
++        // tflite_jni drives both the Rubik's QNN NPU and the Coral USB Edge TPU
++        if (Platform.isQCS6490() || EdgeTpu.isUsbCoralPresent()) {
+             tryLoadJNI(JNITypes.RUBIK_DETECTOR);
+         } else {
+-            logger.warn("Platform does not support Rubik based machine learning!");
++            logger.warn("Platform does not support TFLite (Rubik / Coral) based machine learning!");
+         }
+ 
+         tryLoadJNI(JNITypes.MRCAL);
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index 47d6e13..df46158 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -706,40 +706,38 @@ public class RequestHandler {
+                 return;
+             }
+ 
+-            NeuralNetworkModelManager.Family family;
+-
+-            switch (Platform.getCurrentPlatform()) {
+-                case LINUX_QCS6490:
+-                    family = NeuralNetworkModelManager.Family.RUBIK;
+-                    break;
+-                case LINUX_RK3588_64:
+-                    family = NeuralNetworkModelManager.Family.RKNN;
+-                    break;
+-                default:
+-                    ctx.status(400);
+-                    ctx.result("The current platform does not support object detection models");
+-                    logger.error("The current platform does not support object detection models");
+-                    return;
++            var supportedBackends =
++                    NeuralNetworkModelManager.getInstance().getSupportedBackends().stream()
++                            .map(NeuralNetworkModelManager.Family::valueOf)
++                            .toList();
++
++            if (supportedBackends.isEmpty()) {
++                ctx.status(400);
++                ctx.result("The current platform does not support object detection models");
++                logger.error("The current platform does not support object detection models");
++                return;
+             }
+ 
+-            // If adding additional platforms, check platform matches
+-            if (!modelFile.extension().contains(family.extension())) {
++            // Pick the backend from the file name, so a device with both an NPU and a Coral can
++            // accept either kind of model (e.g. "best.rknn" vs "best_full_integer_quant_edgetpu.tflite")
++            var maybeFamily =
++                    NeuralNetworkModelManager.Family.forFileName(modelFile.filename(), supportedBackends);
++
++            if (maybeFamily.isEmpty()) {
++                String expected =
++                        String.join(
++                                " or ",
++                                supportedBackends.stream()
++                                        .map(NeuralNetworkModelManager.Family::extension)
++                                        .toList());
+                 ctx.status(400);
+-                ctx.result(
+-                        "The uploaded file was not of type '"
+-                                + family.extension()
+-                                + "'. The uploaded file should be a ."
+-                                + family.extension()
+-                                + " file.");
+-                logger.error(
+-                        "The uploaded file was not of type '"
+-                                + family.extension()
+-                                + "'. The uploaded file should be a ."
+-                                + family.extension()
+-                                + " file.");
++                ctx.result("The uploaded file name should end in " + expected);
++                logger.error("The uploaded file name should end in " + expected);
+                 return;
+             }
+ 
++            NeuralNetworkModelManager.Family family = maybeFamily.get();
++
+             Path modelPath =
+                     Paths.get(
+                             ConfigProvider.getInstance().getModelsDirectory().toString(), modelFile.filename());
+@@ -769,7 +767,8 @@ public class RequestHandler {
+                 try {
+                     objDetector =
+                             switch (family) {
+-                                case RUBIK -> new TFLiteModel(modelProperties, TFLiteSource.RUBIK).load();
++                                case RUBIK -> new TFLiteModel(modelProperties, TFLiteSource.QNN).load();
++                                case CORAL -> new TFLiteModel(modelProperties, TFLiteSource.CORAL).load();
+                                 case RKNN -> new RknnModel(modelProperties).load();
+                             };
+                 } catch (RuntimeException e) {

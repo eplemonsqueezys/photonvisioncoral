@@ -1,0 +1,329 @@
+diff --git a/src/main/java/org/photonvision/tflite/TFLiteJNI.java b/src/main/java/org/photonvision/tflite/TFLiteJNI.java
+index 0560ca8..eeedf8b 100644
+--- a/src/main/java/org/photonvision/tflite/TFLiteJNI.java
++++ b/src/main/java/org/photonvision/tflite/TFLiteJNI.java
+@@ -24,7 +24,9 @@ import org.opencv.core.Size;
+ public class TFLiteJNI {
+     public static enum TFLiteSource {
+         QNN(1),
+-        CPU(2);
++        CPU(2),
++        /** Google Coral Edge TPU (USB/PCIe) via libedgetpu.so.1 */
++        CORAL(3);
+ 
+         private int value = 0;
+ 
+diff --git a/src/main/native/cpp/tflite_jni.cpp b/src/main/native/cpp/tflite_jni.cpp
+index a8fbb60..88c4f9d 100644
+--- a/src/main/native/cpp/tflite_jni.cpp
++++ b/src/main/native/cpp/tflite_jni.cpp
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <iostream>
+ #include <memory>
+@@ -146,8 +147,8 @@ Java_org_photonvision_tflite_TFLiteJNI_create
+   int source_int = static_cast<int>(source);
+ 
+   // This should be updated whenever a new model version is added
+-  if (source_int < TFLiteSource::NONE ||
+-      source_int > TFLiteSource::NUM_SOURCES) {
++  if (source_int <= TFLiteSource::NONE ||
++      source_int >= TFLiteSource::NUM_SOURCES) {
+     ThrowRuntimeException(env, "Invalid TFLite source specified");
+     env->ReleaseStringUTFChars(modelPath, model_name);
+     return 0;
+@@ -181,40 +182,61 @@ Java_org_photonvision_tflite_TFLiteJNI_create
+     // Create external delegate options
+     // We just have to trust that this creates okay, but conveniently if it
+     // fails the check when we insert options will catch it.
++    const char* delegate_lib = tflite_source == TFLiteSource::CORAL
++                                   ? "libedgetpu.so.1"
++                                   : "libQnnTFLiteDelegate.so";
+     TfLiteExternalDelegateOptions delegateOptsValue =
+-        TfLiteExternalDelegateOptionsDefault("libQnnTFLiteDelegate.so");
++        TfLiteExternalDelegateOptionsDefault(delegate_lib);
+ 
+     TfLiteExternalDelegateOptions* delegateOpts = &delegateOptsValue;
+ 
+-    // See
+-    // https://docs.qualcomm.com/bundle/publicresource/topics/80-70014-54/external-delegate-options-for-qnn-delegate.html
+-    // for what the various delegate options are
+-    if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "backend_type",
+-                                            "htp") != kTfLiteOk) {
+-      ThrowRuntimeException(env, "Failed to set backend type to htp");
+-      env->ReleaseStringUTFChars(modelPath, model_name);
+-      return 0;
+-    }
+-
+-    if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_use_conv_hmx",
+-                                            "1") != kTfLiteOk) {
+-      ThrowRuntimeException(env, "Failed to enable convolutions");
+-      env->ReleaseStringUTFChars(modelPath, model_name);
+-      return 0;
+-    }
+-
+-    if (TfLiteExternalDelegateOptionsInsert(
+-            delegateOpts, "htp_performance_mode", "2") != kTfLiteOk) {
+-      ThrowRuntimeException(env, "Failed to set htp performance mode");
+-      env->ReleaseStringUTFChars(modelPath, model_name);
+-      return 0;
++    if (tflite_source == TFLiteSource::CORAL) {
++      // libedgetpu exposes tflite_plugin_create_delegate, so it can be loaded
++      // as a TFLite external delegate. "usb" selects the first USB Edge TPU.
++      // See https://coral.ai/docs/edgetpu/tflite-python/#load-tensorflow-lite-and-run-an-inference
++      if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "device", "usb") !=
++          kTfLiteOk) {
++        ThrowRuntimeException(env, "Failed to set Edge TPU device to usb");
++        TfLiteInterpreterOptionsDelete(interpreterOpts);
++        delete detector;
++        env->ReleaseStringUTFChars(modelPath, model_name);
++        return 0;
++      }
++    } else {
++      // See
++      // https://docs.qualcomm.com/bundle/publicresource/topics/80-70014-54/external-delegate-options-for-qnn-delegate.html
++      // for what the various delegate options are
++      if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "backend_type",
++                                              "htp") != kTfLiteOk) {
++        ThrowRuntimeException(env, "Failed to set backend type to htp");
++        env->ReleaseStringUTFChars(modelPath, model_name);
++        return 0;
++      }
++
++      if (TfLiteExternalDelegateOptionsInsert(delegateOpts, "htp_use_conv_hmx",
++                                              "1") != kTfLiteOk) {
++        ThrowRuntimeException(env, "Failed to enable convolutions");
++        env->ReleaseStringUTFChars(modelPath, model_name);
++        return 0;
++      }
++
++      if (TfLiteExternalDelegateOptionsInsert(
++              delegateOpts, "htp_performance_mode", "2") != kTfLiteOk) {
++        ThrowRuntimeException(env, "Failed to set htp performance mode");
++        env->ReleaseStringUTFChars(modelPath, model_name);
++        return 0;
++      }
+     }
+ 
+     // Create the delegate
+     delegate = TfLiteExternalDelegateCreate(delegateOpts);
+ 
+     if (!delegate) {
+-      ThrowRuntimeException(env, "Failed to create external delegate");
++      ThrowRuntimeException(
++          env, tflite_source == TFLiteSource::CORAL
++                   ? "Failed to create Edge TPU delegate. Is libedgetpu1-std "
++                     "installed and the Coral plugged in?"
++                   : "Failed to create external delegate");
+       env->ReleaseStringUTFChars(modelPath, model_name);
+       return 0;
+     } else {
+@@ -363,7 +385,31 @@ Java_org_photonvision_tflite_TFLiteJNI_detect
+     return nullptr;
+   }
+ 
+-  std::memcpy(TfLiteTensorData(input), rgb.data, TfLiteTensorByteSize(input));
++  switch (TfLiteTensorType(input)) {
++    case kTfLiteUInt8:
++      std::memcpy(TfLiteTensorData(input), rgb.data,
++                  TfLiteTensorByteSize(input));
++      break;
++    case kTfLiteInt8: {
++      // Ultralytics full-integer exports (incl. Edge TPU) use int8 input.
++      // Map 0..255 pixels through the input quantization params.
++      const TfLiteQuantizationParams qp = TfLiteTensorQuantizationParams(input);
++      int8_t lut[256];
++      for (int v = 0; v < 256; v++) {
++        float q = qp.scale > 0 ? std::round((v / 255.0f) / qp.scale) + qp.zero_point
++                               : v - 128.0f;
++        lut[v] = static_cast<int8_t>(std::max(-128.0f, std::min(127.0f, q)));
++      }
++      int8_t* dst = static_cast<int8_t*>(TfLiteTensorData(input));
++      const size_t n = std::min(static_cast<size_t>(TfLiteTensorByteSize(input)),
++                                rgb.total() * rgb.elemSize());
++      for (size_t i = 0; i < n; i++) dst[i] = lut[rgb.data[i]];
++      break;
++    }
++    default:
++      ThrowRuntimeException(env, "Input tensor must be uint8 or int8");
++      return nullptr;
++  }
+ 
+ // Start timer for benchmark
+ #ifndef NDEBUG
+@@ -392,8 +438,15 @@ Java_org_photonvision_tflite_TFLiteJNI_detect
+     switch (detector->version) {
+       case ModelVersion::YOLOV8:
+       case ModelVersion::YOLOV11:
+-        results = yoloPostProc(interpreter, boxThresh, nmsThreshold,
+-                               input_img->cols, input_img->rows);
++        if (TfLiteInterpreterGetOutputTensorCount(interpreter) >= 3) {
++          // Qualcomm AI Hub style: separate boxes/scores/classes outputs
++          results = yoloPostProc(interpreter, boxThresh, nmsThreshold,
++                                 input_img->cols, input_img->rows);
++        } else {
++          // Ultralytics style: single [1, 4 + nc, N] output (Edge TPU export)
++          results = ultralyticsPostProc(interpreter, boxThresh, nmsThreshold,
++                                        input_img->cols, input_img->rows);
++        }
+         break;
+       default:
+         ThrowRuntimeException(env, "Unsupported YOLO version specified");
+@@ -449,10 +502,10 @@ Java_org_photonvision_tflite_TFLiteJNI_isQuantized
+     return JNI_FALSE;
+   }
+ 
+-  // Check if the tensor type is kTfLiteUInt8
++  // Check if the tensor type is kTfLiteUInt8 or kTfLiteInt8
+   TfLiteType tensorType = TfLiteTensorType(input);
+ 
+-  if (tensorType == kTfLiteUInt8) {
++  if (tensorType == kTfLiteUInt8 || tensorType == kTfLiteInt8) {
+     DEBUG_PRINT("INFO: Input tensor is quantized\n");
+     return JNI_TRUE;  // The model is quantized
+   } else {
+diff --git a/src/main/native/cpp/utils.hpp b/src/main/native/cpp/utils.hpp
+index 41304ed..e086010 100644
+--- a/src/main/native/cpp/utils.hpp
++++ b/src/main/native/cpp/utils.hpp
+@@ -31,7 +31,7 @@ enum ModelVersion { YOLOV8 = 1, YOLOV11 = 2 };
+ /**
+  * Where should TFLite run inference.
+  */
+-enum TFLiteSource { NONE = 0, QNN = 1, CPU = 2, NUM_SOURCES = 3 };
++enum TFLiteSource { NONE = 0, QNN = 1, CPU = 2, CORAL = 3, NUM_SOURCES = 4 };
+ 
+ inline bool uses_external_delegate(TFLiteSource source) {
+   return source != CPU;
+diff --git a/src/main/native/cpp/yoloPostProc.cpp b/src/main/native/cpp/yoloPostProc.cpp
+index c9925f3..6c8cfeb 100644
+--- a/src/main/native/cpp/yoloPostProc.cpp
++++ b/src/main/native/cpp/yoloPostProc.cpp
+@@ -18,6 +18,8 @@
+ #include "yoloPostProc.hpp"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <stdexcept>
+ #include <cstdio>
+ #include <iostream>
+ #include <memory>
+@@ -169,3 +171,93 @@ std::vector<DetectResult> yoloPostProc(TfLiteInterpreter* interpreter,
+ 
+   return results;
+ }
++
++std::vector<DetectResult> ultralyticsPostProc(TfLiteInterpreter* interpreter,
++                                              double boxThresh,
++                                              double nmsThreshold,
++                                              int input_img_width,
++                                              int input_img_height) {
++  const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(interpreter, 0);
++  if (!out || TfLiteTensorNumDims(out) != 3) {
++    throw std::runtime_error(
++        "Expected a single output tensor of shape [1, 4 + classes, boxes]");
++  }
++
++  const int d1 = TfLiteTensorDim(out, 1);
++  const int d2 = TfLiteTensorDim(out, 2);
++  // The smaller dimension is the per-box channel dimension (4 + classes).
++  const bool channelsFirst = d1 < d2;
++  const int channels = channelsFirst ? d1 : d2;
++  const int numBoxes = channelsFirst ? d2 : d1;
++  const int numClasses = channels - 4;
++  if (numClasses < 1) {
++    throw std::runtime_error("Output tensor has too few channels for YOLO");
++  }
++
++  const TfLiteType type = TfLiteTensorType(out);
++  if (type != kTfLiteUInt8 && type != kTfLiteInt8 && type != kTfLiteFloat32) {
++    throw std::runtime_error("Unsupported output tensor type");
++  }
++  const TfLiteQuantizationParams qp = TfLiteTensorQuantizationParams(out);
++  void* data = TfLiteTensorData(out);
++
++  auto at = [&](int box, int ch) -> float {
++    const int idx = channelsFirst ? ch * numBoxes + box : box * channels + ch;
++    return get_dequant_value(data, type, idx, qp.zero_point, qp.scale);
++  };
++
++  struct Candidate {
++    float cx, cy, w, h, score;
++    int classId;
++  };
++  std::vector<Candidate> raw;
++  float maxCoord = 0.0f;
++
++  for (int i = 0; i < numBoxes; ++i) {
++    int bestClass = 0;
++    float best = at(i, 4);
++    for (int c = 1; c < numClasses; ++c) {
++      const float v = at(i, 4 + c);
++      if (v > best) {
++        best = v;
++        bestClass = c;
++      }
++    }
++    if (best < boxThresh) continue;
++
++    Candidate cand{at(i, 0), at(i, 1), at(i, 2), at(i, 3), best, bestClass};
++    maxCoord = std::max({maxCoord, cand.cx, cand.cy, cand.w, cand.h});
++    raw.push_back(cand);
++  }
++
++  // Ultralytics TFLite exports emit normalized coordinates; scale to pixels.
++  const bool normalized = maxCoord <= 2.0f;
++  const float sx = normalized ? static_cast<float>(input_img_width) : 1.0f;
++  const float sy = normalized ? static_cast<float>(input_img_height) : 1.0f;
++
++  std::vector<DetectResult> candidates;
++  candidates.reserve(raw.size());
++  for (const auto& c : raw) {
++    float x1 = (c.cx - c.w / 2.0f) * sx;
++    float y1 = (c.cy - c.h / 2.0f) * sy;
++    float x2 = (c.cx + c.w / 2.0f) * sx;
++    float y2 = (c.cy + c.h / 2.0f) * sy;
++
++    x1 = std::max(0.0f, std::min(x1, static_cast<float>(input_img_width)));
++    y1 = std::max(0.0f, std::min(y1, static_cast<float>(input_img_height)));
++    x2 = std::max(0.0f, std::min(x2, static_cast<float>(input_img_width)));
++    y2 = std::max(0.0f, std::min(y2, static_cast<float>(input_img_height)));
++    if (x1 >= x2 || y1 >= y2) continue;
++
++    BoundingBox box{static_cast<int>(std::round(x1)),
++                    static_cast<int>(std::round(y1)),
++                    static_cast<int>(std::round(x2)),
++                    static_cast<int>(std::round(y2)), 0.0};
++    candidates.push_back(DetectResult{c.classId, box, c.score});
++  }
++
++  DEBUG_PRINT("INFO: Ultralytics postproc kept %zu candidates (normalized=%d)\n",
++              candidates.size(), normalized ? 1 : 0);
++
++  return optimizedNMS(candidates, static_cast<float>(nmsThreshold));
++}
+diff --git a/src/main/native/cpp/yoloPostProc.hpp b/src/main/native/cpp/yoloPostProc.hpp
+index d2fff29..f901ae7 100644
+--- a/src/main/native/cpp/yoloPostProc.hpp
++++ b/src/main/native/cpp/yoloPostProc.hpp
+@@ -36,3 +36,16 @@ std::vector<DetectResult> yoloPostProc(TfLiteInterpreter* interpreter,
+                                        double boxThresh, double nmsThreshold,
+                                        int input_img_width,
+                                        int input_img_height);
++
++/**
++ * Post-processing for Ultralytics TFLite / Edge TPU exports, which have a
++ * single output tensor shaped [1, 4 + num_classes, num_boxes] (or the
++ * transposed [1, num_boxes, 4 + num_classes]). Boxes are center-x, center-y,
++ * width, height and may be normalized to [0, 1] or in pixels. Handles uint8,
++ * int8 and float32 outputs.
++ */
++std::vector<DetectResult> ultralyticsPostProc(TfLiteInterpreter* interpreter,
++                                              double boxThresh,
++                                              double nmsThreshold,
++                                              int input_img_width,
++                                              int input_img_height);
