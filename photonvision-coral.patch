@@ -1,5 +1,5 @@
 diff --git a/build.gradle b/build.gradle
-index f9bb4d7..b18e111 100644
+index f9bb4d77..b18e1111 100644
 --- a/build.gradle
 +++ b/build.gradle
 @@ -42,7 +42,8 @@ ext {
@@ -13,10 +13,29 @@ index f9bb4d7..b18e111 100644
      mrcalVersion = "dev-v2027.0.2-12-gdc31176";
  
 diff --git a/photon-client/src/components/settings/ObjectDetectionCard.vue b/photon-client/src/components/settings/ObjectDetectionCard.vue
-index f7968ab..d0b6a40 100644
+index f7968ab2..99e8a4d8 100644
 --- a/photon-client/src/components/settings/ObjectDetectionCard.vue
 +++ b/photon-client/src/components/settings/ObjectDetectionCard.vue
-@@ -198,21 +198,33 @@ const handleBulkImport = async () => {
+@@ -123,6 +123,18 @@ const nukeModels = async () => {
+ 
+ const showBulkImportDialog = ref(false);
+ const importFile = ref<File | null>(null);
++// File ending the server needs to recognize an exported model on re-import
++const modelFileExtension = (family: string) => {
++  switch (family) {
++    case "RKNN":
++      return ".rknn";
++    case "CORAL":
++      return "_edgetpu.tflite";
++    default:
++      return ".tflite";
++  }
++};
++
+ const handleBulkImport = async () => {
+   if (importFile.value === null) return;
+ 
+@@ -198,21 +210,33 @@ const handleBulkImport = async () => {
                    640x640 YOLOv8 and YOLOv11 models trained and converted to `.tflite` format for QCS6490 compatible
                    backends are currently supported!
                  </span>
@@ -53,8 +72,17 @@ index f7968ab..d0b6a40 100644
                      "
                    />
                    <v-text-field
+@@ -423,7 +447,7 @@ const handleBulkImport = async () => {
+                   ref="exportIndividualModel"
+                   style="color: black; text-decoration: none; display: none"
+                   :href="`http://${address}/api/objectdetection/exportIndividual?modelPath=${showInfo.model.modelPath}`"
+-                  :download="`${showInfo.model.nickname}_${showInfo.model.family}_${showInfo.model.version}_${showInfo.model.resolutionWidth}x${showInfo.model.resolutionHeight}_${showInfo.model.labels.join('_')}.${showInfo.model.family.toLowerCase()}`"
++                  :download="`${showInfo.model.nickname}_${showInfo.model.family}_${showInfo.model.version}_${showInfo.model.resolutionWidth}x${showInfo.model.resolutionHeight}_${showInfo.model.labels.join('_')}${modelFileExtension(showInfo.model.family)}`"
+                   target="_blank"
+                 />
+                 <div class="pt-5">
 diff --git a/photon-client/src/types/SettingTypes.ts b/photon-client/src/types/SettingTypes.ts
-index 3d94044..a4a7e60 100644
+index 3d940449..a4a7e60d 100644
 --- a/photon-client/src/types/SettingTypes.ts
 +++ b/photon-client/src/types/SettingTypes.ts
 @@ -23,7 +23,7 @@ export interface ObjectDetectionModelProperties {
@@ -67,7 +95,7 @@ index 3d94044..a4a7e60 100644
  }
  
 diff --git a/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java b/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
-index 94f8d52..1586668 100644
+index 94f8d52f..15866683 100644
 --- a/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
 +++ b/photon-core/src/main/java/org/photonvision/common/configuration/NeuralNetworkModelManager.java
 @@ -35,6 +35,7 @@ import java.util.jar.JarEntry;
@@ -175,7 +203,7 @@ index 94f8d52..1586668 100644
              logger.error("Failed to discover models at " + modelsDirectory.getAbsolutePath(), e);
 diff --git a/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java b/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java
 new file mode 100644
-index 0000000..6bbfc55
+index 00000000..6bbfc550
 --- /dev/null
 +++ b/photon-core/src/main/java/org/photonvision/common/hardware/EdgeTpu.java
 @@ -0,0 +1,80 @@
@@ -260,7 +288,7 @@ index 0000000..6bbfc55
 +    }
 +}
 diff --git a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
-index 3a9031e..ef1b95f 100644
+index 3a9031ee..ef1b95ff 100644
 --- a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
 +++ b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteModel.java
 @@ -52,8 +52,8 @@ public class TFLiteModel implements Model {
@@ -275,7 +303,7 @@ index 3a9031e..ef1b95f 100644
  
          if (properties.version() != Version.YOLOV8 && properties.version() != Version.YOLOV11) {
 diff --git a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
-index 2160ed0..6c86d13 100644
+index 2160ed05..6c86d139 100644
 --- a/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
 +++ b/photon-core/src/main/java/org/photonvision/vision/objects/TFLiteObjectDetector.java
 @@ -61,7 +61,7 @@ public class TFLiteObjectDetector implements ObjectDetector {
@@ -288,7 +316,7 @@ index 2160ed0..6c86d13 100644
      public TFLiteObjectDetector(TFLiteModel model, TFLiteSource backend) {
          this.model = model;
 diff --git a/photon-server/src/main/java/org/photonvision/Main.java b/photon-server/src/main/java/org/photonvision/Main.java
-index e1674dd..0420f03 100644
+index e1674ddd..0420f034 100644
 --- a/photon-server/src/main/java/org/photonvision/Main.java
 +++ b/photon-server/src/main/java/org/photonvision/Main.java
 @@ -30,6 +30,7 @@ import org.photonvision.common.configuration.CameraConfiguration;
@@ -314,7 +342,7 @@ index e1674dd..0420f03 100644
  
          tryLoadJNI(JNITypes.MRCAL);
 diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
-index 47d6e13..df46158 100644
+index 47d6e135..df46158c 100644
 --- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
 +++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
 @@ -706,40 +706,38 @@ public class RequestHandler {
